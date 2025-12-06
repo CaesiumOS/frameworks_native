@@ -255,7 +255,7 @@ ui::Transform::RotationFlags Output::getTransformHint() const {
     return static_cast<ui::Transform::RotationFlags>(getState().transform.getOrientation());
 }
 
-void Output::setLayerFilter(ui::LayerFilter filter) {
+void Output::setLayerFilter(LayerFilter filter) {
     editState().layerFilter = filter;
     dirtyEntireOutput();
 }
@@ -399,7 +399,7 @@ Region Output::getDirtyRegion() const {
     return outputState.dirtyRegion.intersect(outputState.layerStackSpace.getContent());
 }
 
-bool Output::includesLayer(ui::LayerFilter filter) const {
+bool Output::includesLayer(LayerFilter filter) const {
     return getState().layerFilter.includes(filter);
 }
 
@@ -586,8 +586,15 @@ void Output::ensureOutputLayerIfVisible(sp<compositionengine::LayerFE>& layerFE,
         return;
     }
 
-    bool computeAboveCoveredExcludingOverlays = coverage.aboveCoveredLayersExcludingOverlays &&
-            !layerFEState->outputFilter.toInternalDisplay;
+    bool computeAboveCoveredExcludingOverlays = [&]() {
+        if (FlagManager::getInstance().connected_displays_cursor()) {
+            return coverage.aboveCoveredLayersExcludingOverlays &&
+                    !layerFEState->outputFilter.skipScreenshot;
+        } else {
+            return coverage.aboveCoveredLayersExcludingOverlays &&
+                    !layerFEState->outputFilter.toInternalDisplay;
+        }
+    }();
 
     /*
      * opaqueRegion: area of a surface that is fully opaque.
@@ -872,9 +879,13 @@ void Output::updateCompositionState(const compositionengine::CompositionRefreshA
     auto* properties = getOverlaySupport();
 
     for (auto* layer : getOutputLayersOrderedByZ()) {
+        const ui::LayerStack outputLayerStack =
+                layer->getOutput().getState().layerFilter.layerStack;
+        const bool layerForceClientComposition =
+                refreshArgs.forcedClientCompositionLayerStacks.contains(outputLayerStack);
+
         layer->updateCompositionState(refreshArgs.updatingGeometryThisFrame,
-                                      refreshArgs.devOptForceClientComposition ||
-                                              forceClientComposition,
+                                      layerForceClientComposition || forceClientComposition,
                                       refreshArgs.internalDisplayRotationFlags,
                                       properties ? properties->lutProperties : std::nullopt);
 
@@ -1692,6 +1703,8 @@ void Output::presentFrameAndReleaseLayers(bool flushEvenWhenDisabled) {
 
     mRenderSurface->onPresentDisplayCompleted();
 
+    const bool force_slower_follower_gpu_composition =
+            FlagManager::getInstance().force_slower_follower_gpu_composition();
     for (auto* layer : getOutputLayersOrderedByZ()) {
         // The layer buffer from the previous frame (if any) is released
         // by HWC only when the release fence from this frame (if any) is
@@ -1706,13 +1719,26 @@ void Output::presentFrameAndReleaseLayers(bool flushEvenWhenDisabled) {
 
         // If the layer was client composited in the previous frame, we
         // need to merge with the previous client target acquire fence.
-        // Since we do not track that, always merge with the current
-        // client target acquire fence when it is available, even though
-        // this is suboptimal.
-        // TODO(b/121291683): Track previous frame client target acquire fence.
-        if (outputState.usesClientComposition) {
+        if (force_slower_follower_gpu_composition) {
             releaseFence =
-                    Fence::merge("LayerRelease", releaseFence, frame.clientTargetAcquireFence);
+                    Fence::merge("LayerRelease", releaseFence,
+                                 layer->getLayerFE().getAndClearLastClientTargetAcquireFence());
+
+            // If there's no present fence nor last composition acquire fence, then return the
+            // current acquire fence rather than a NO_FENCE which would release immediately.
+            if (releaseFence == Fence::NO_FENCE) {
+                releaseFence = frame.clientTargetAcquireFence;
+            }
+
+            layer->getLayerFE().setLastClientTargetAcquireFence(frame.clientTargetAcquireFence);
+        } else {
+            // Since we do not track that, always merge with the current
+            // client target acquire fence when it is available, even though
+            // this is suboptimal.
+            if (outputState.usesClientComposition) {
+                releaseFence =
+                        Fence::merge("LayerRelease", releaseFence, frame.clientTargetAcquireFence);
+            }
         }
         layer->getLayerFE().setReleaseFence(releaseFence);
         layer->getLayerFE().setReleasedBuffer(layer->getLayerFE().getCompositionState()->buffer);

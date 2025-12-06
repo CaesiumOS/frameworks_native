@@ -21,15 +21,18 @@
 #include "TouchInputMapper.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
 #include <cstddef>
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <utility>
 
 #include <math.h>
 
+#include <android-base/logging.h>
 #include <android-base/stringprintf.h>
 #include <android/input.h>
 #include <com_android_input_flags.h>
@@ -49,6 +52,8 @@
 #include "ui/Rotation.h"
 
 namespace android {
+
+using std::chrono_literals::operator""ms;
 
 namespace input_flags = com::android::input::flags;
 
@@ -432,21 +437,10 @@ TouchInputMapper::Parameters TouchInputMapper::computeParameters(
         }
     }
 
-    parameters.hasAssociatedDisplay = false;
     parameters.associatedDisplayIsExternal = false;
-    if (parameters.orientationAware ||
-        parameters.deviceType == Parameters::DeviceType::TOUCH_SCREEN ||
-        parameters.deviceType == Parameters::DeviceType::POINTER ||
-        (parameters.deviceType == Parameters::DeviceType::TOUCH_NAVIGATION &&
-         deviceContext.getAssociatedViewport())) {
-        parameters.hasAssociatedDisplay = true;
-        if (parameters.deviceType == Parameters::DeviceType::TOUCH_SCREEN) {
-            parameters.associatedDisplayIsExternal = deviceContext.isExternal();
-            parameters.uniqueDisplayId = config.getString("touch.displayId").value_or("").c_str();
-        }
-    }
-    if (deviceContext.getAssociatedDisplayPort()) {
-        parameters.hasAssociatedDisplay = true;
+    if (parameters.deviceType == Parameters::DeviceType::TOUCH_SCREEN) {
+        parameters.associatedDisplayIsExternal = deviceContext.isExternal();
+        parameters.uniqueDisplayId = config.getString("touch.displayId").value_or("").c_str();
     }
 
     // Initial downs on external touch devices should wake the device.
@@ -506,9 +500,7 @@ void TouchInputMapper::dumpParameters(std::string& dump) {
 
     dump += INDENT4 "DeviceType: " + ftl::enum_string(mParameters.deviceType) + "\n";
 
-    dump += StringPrintf(INDENT4 "AssociatedDisplay: hasAssociatedDisplay=%s, isExternal=%s, "
-                                 "displayId='%s'\n",
-                         toString(mParameters.hasAssociatedDisplay),
+    dump += StringPrintf(INDENT4 "AssociatedDisplay: isExternal=%s, displayId='%s'\n",
                          toString(mParameters.associatedDisplayIsExternal),
                          mParameters.uniqueDisplayId.c_str());
     dump += StringPrintf(INDENT4 "OrientationAware: %s\n", toString(mParameters.orientationAware));
@@ -546,60 +538,54 @@ bool TouchInputMapper::hasExternalStylus() const {
 
 /**
  * Determine which DisplayViewport to use.
- * 1. If a device has associated display, get the matching viewport.
- * 2. Always use the suggested viewport from WindowManagerService for pointers.
- * 3. Get the matching viewport by either unique id in idc file or by the display type
- * (internal or external).
- * 4. Otherwise, use a non-display viewport.
  */
 std::optional<DisplayViewport> TouchInputMapper::findViewport() {
-    if (mParameters.hasAssociatedDisplay) {
-        if (getDeviceContext().getAssociatedViewport()) {
-            return getDeviceContext().getAssociatedViewport();
-        }
+    // 1. If a device has associated display, always use the matching viewport.
+    if (getDeviceContext().getAssociatedViewport()) {
+        return getDeviceContext().getAssociatedViewport();
+    }
 
-        if (mDeviceMode == DeviceMode::POINTER) {
-            std::optional<DisplayViewport> viewport =
-                    mConfig.getDisplayViewportById(mConfig.defaultPointerDisplayId);
-            if (viewport) {
-                return viewport;
-            } else {
-                ALOGW("Can't find designated display viewport with ID %s for pointers.",
-                      mConfig.defaultPointerDisplayId.toString().c_str());
-            }
-        }
-
-        // Check if uniqueDisplayId is specified in idc file.
-        if (!mParameters.uniqueDisplayId.empty()) {
-            return mConfig.getDisplayViewportByUniqueId(mParameters.uniqueDisplayId);
-        }
-
-        ViewportType viewportTypeToUse;
-        if (mParameters.associatedDisplayIsExternal) {
-            viewportTypeToUse = ViewportType::EXTERNAL;
-        } else {
-            viewportTypeToUse = ViewportType::INTERNAL;
-        }
-
+    // 2. Try to use the suggested viewport from WindowManagerService for pointers.
+    if (mDeviceMode == DeviceMode::POINTER) {
         std::optional<DisplayViewport> viewport =
-                mConfig.getDisplayViewportByType(viewportTypeToUse);
-        if (!viewport && viewportTypeToUse == ViewportType::EXTERNAL) {
-            ALOGW("Input device %s should be associated with external display, "
-                  "fallback to internal one for the external viewport is not found.",
-                  getDeviceName().c_str());
-            viewport = mConfig.getDisplayViewportByType(ViewportType::INTERNAL);
+                mConfig.getDisplayViewportById(mConfig.defaultPointerDisplayId);
+        if (viewport) {
+            return viewport;
+        } else {
+            ALOGW("Can't find designated display viewport with ID %s for pointers.",
+                  mConfig.defaultPointerDisplayId.toString().c_str());
         }
+    }
 
+    // 3. Get the matching viewport if uniqueDisplayId is specified in idc file.
+    if (!mParameters.uniqueDisplayId.empty()) {
+        return mConfig.getDisplayViewportByUniqueId(mParameters.uniqueDisplayId);
+    }
+
+    // 4. Use a non-display viewport for touch navigation devices.
+    if (mParameters.deviceType == Parameters::DeviceType::TOUCH_NAVIGATION) {
+        // Touch navigation devices can work without being associated with a display since they
+        // are focus-dispatched events, so use a non-display viewport.
+        DisplayViewport viewport;
+        viewport.setNonDisplayViewport(mRawPointerAxes.getRawWidth(),
+                                       mRawPointerAxes.getRawHeight());
         return viewport;
     }
 
-    // No associated display, return a non-display viewport.
-    DisplayViewport newViewport;
-    // Raw width and height in the natural orientation.
-    int32_t rawWidth = mRawPointerAxes.getRawWidth();
-    int32_t rawHeight = mRawPointerAxes.getRawHeight();
-    newViewport.setNonDisplayViewport(rawWidth, rawHeight);
-    return std::make_optional(newViewport);
+    // 5. Fall back to using any appropriate viewport based on the display type
+    //    (internal or external).
+    const ViewportType viewportTypeToUse = mParameters.associatedDisplayIsExternal
+            ? ViewportType::EXTERNAL
+            : ViewportType::INTERNAL;
+    std::optional<DisplayViewport> viewport = mConfig.getDisplayViewportByType(viewportTypeToUse);
+    if (!viewport && viewportTypeToUse == ViewportType::EXTERNAL) {
+        ALOGW("Input device %s should be associated with external display, "
+              "fallback to internal one for the external viewport is not found.",
+              getDeviceName().c_str());
+        viewport = mConfig.getDisplayViewportByType(ViewportType::INTERNAL);
+    }
+
+    return viewport;
 }
 
 int32_t TouchInputMapper::clampResolution(const char* axisName, int32_t resolution) const {
@@ -979,11 +965,6 @@ void TouchInputMapper::configureInputDevice(nsecs_t when, bool* outResetNeeded) 
 
     // Raw width and height in the natural orientation.
     const ui::Size rawSize{mRawPointerAxes.getRawWidth(), mRawPointerAxes.getRawHeight()};
-    const int32_t rawXResolution = mRawPointerAxes.x.resolution;
-    const int32_t rawYResolution = mRawPointerAxes.y.resolution;
-    // Calculate the mean resolution when both x and y resolution are set, otherwise set it to 0.
-    const float rawMeanResolution =
-            (rawXResolution > 0 && rawYResolution > 0) ? (rawXResolution + rawYResolution) / 2 : 0;
 
     const DisplayViewport& newViewport = newViewportOpt.value_or(kUninitializedViewport);
     bool viewportChanged;
@@ -1493,6 +1474,9 @@ std::list<NotifyArgs> TouchInputMapper::sync(nsecs_t when, nsecs_t readTime) {
         std::string line;
         while (std::getline(stream, line, '\n')) {
             ALOGD(INDENT "%s", line.c_str());
+            // To prevent overwhelming liblog, add a small delay between each line to give it
+            // time to process the data written so far.
+            std::this_thread::sleep_for(1ms);
         }
     }
 
@@ -1584,6 +1568,7 @@ std::list<NotifyArgs> TouchInputMapper::cookAndDispatch(nsecs_t when, nsecs_t re
     bool consumed;
     out += consumeRawTouches(when, readTime, policyFlags, consumed /*byref*/);
     if (consumed) {
+        LOG_IF(INFO, debugRawEvents()) << "Touch consumed by consumeRawTouches, eventTime=" << when;
         mCurrentRawState.rawPointerData.clear();
     }
 
@@ -1676,8 +1661,7 @@ std::list<NotifyArgs> TouchInputMapper::cookAndDispatch(nsecs_t when, nsecs_t re
 }
 
 bool TouchInputMapper::isTouchScreen() {
-    return mParameters.deviceType == Parameters::DeviceType::TOUCH_SCREEN &&
-            mParameters.hasAssociatedDisplay;
+    return mParameters.deviceType == Parameters::DeviceType::TOUCH_SCREEN;
 }
 
 ui::LogicalDisplayId TouchInputMapper::resolveDisplayId() const {
@@ -1877,6 +1861,7 @@ std::list<NotifyArgs> TouchInputMapper::consumeRawTouches(nsecs_t when, nsecs_t 
         }
         if (!hoveringPointersInFrame) {
             // All hovering pointers are outside the physical frame.
+            LOG(WARNING) << "Dropping hover, all pointers are outside the physical frame";
             outConsumed = true;
             return out;
         }
@@ -1915,6 +1900,8 @@ std::list<NotifyArgs> TouchInputMapper::consumeRawTouches(nsecs_t when, nsecs_t 
                     }
                 }
             }
+            LOG(WARNING) << "Dropping pointer " << id << " at (" << pointer.x << ", " << pointer.y
+                         << "), it is outside of the physical frame";
             outConsumed = true;
             return out;
         }
@@ -2099,14 +2086,13 @@ std::list<NotifyArgs> TouchInputMapper::dispatchTouches(nsecs_t when, nsecs_t re
                 mDownTime = when;
             }
 
-            out.push_back(
-                    dispatchMotion(when, readTime, policyFlags, mSource, resolveDisplayId(),
-                                   AMOTION_EVENT_ACTION_POINTER_DOWN, 0, 0, metaState, buttonState,
-                                   mCurrentCookedState.cookedPointerData.pointerProperties,
-                                   mCurrentCookedState.cookedPointerData.pointerCoords,
-                                   mCurrentCookedState.cookedPointerData.idToIndex,
-                                   dispatchedIdBits, downId, mOrientedXPrecision,
-                                   mOrientedYPrecision, mDownTime, MotionClassification::NONE));
+            out.push_back(dispatchMotion(when, readTime, policyFlags, resolveDisplayId(),
+                                         AMOTION_EVENT_ACTION_POINTER_DOWN, 0, 0, metaState,
+                                         buttonState,
+                                         mCurrentCookedState.cookedPointerData.pointerProperties,
+                                         mCurrentCookedState.cookedPointerData.pointerCoords,
+                                         mCurrentCookedState.cookedPointerData.idToIndex,
+                                         dispatchedIdBits, downId));
         }
     }
     return out;
@@ -4016,8 +4002,10 @@ bool TouchInputMapper::markSupportedKeyCodes(uint32_t sourceMask,
 }
 
 std::optional<ui::LogicalDisplayId> TouchInputMapper::getAssociatedDisplayId() const {
-    return mParameters.hasAssociatedDisplay ? std::make_optional(mViewport.displayId)
-                                            : std::nullopt;
+    if (mViewport == kUninitializedViewport) {
+        return std::nullopt;
+    }
+    return mViewport.displayId;
 }
 
 } // namespace android
